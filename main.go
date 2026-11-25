@@ -30,7 +30,6 @@ var logger = func() *zap.Logger {
 var (
 	netif         *net.Interface
 	targetSubnets *netipx.IPSet
-	handle        *afpacket.TPacket
 )
 
 var app = &cli.App{
@@ -47,11 +46,6 @@ var app = &cli.App{
 			Name:    "subnet",
 			Aliases: []string{"n"},
 			Usage:   "static target subnet",
-		},
-		&cli.StringSliceFlag{
-			Name:    "docker-network",
-			Aliases: []string{"N"},
-			Usage:   "Docker network name",
 		},
 	},
 	HideHelpCommand: true,
@@ -73,15 +67,10 @@ var app = &cli.App{
 			return cli.Exit(e, 1)
 		}
 
-		dockerNetworks = c.StringSlice("docker-network")
-
 		return nil
 	},
 	Action: func(c *cli.Context) error {
-		hi, e := gatherHostInfo()
-		if e != nil {
-			return cli.Exit(e, 1)
-		}
+		hi := gatherHostInfo()
 		h, e := afpacket.NewTPacket(afpacket.OptInterface(netif.Name))
 		if e != nil {
 			return cli.Exit(e, 1)
@@ -91,61 +80,23 @@ var app = &cli.App{
 		}
 		solicitations := CaptureNeighSolicitation(h)
 
-		if len(dockerNetworks) > 0 {
-			if e = dockerListen(); e != nil {
-				return cli.Exit(e, 1)
-			}
-		}
-
 		sbuf := gopacket.NewSerializeBuffer()
-	L:
 		for {
-			select {
-			case ns := <-solicitations:
-				logEntry := logger.With(zap.Stringer("ns", ns))
-				switch {
-				case dockerActiveIPs.Contains(ns.TargetIP):
-					logEntry = logEntry.With(zap.String("reason", "docker"))
-				case ns.DestIP.IsMulticast() && targetSubnets.Contains(ns.TargetIP):
-					logEntry = logEntry.With(zap.String("reason", "static"))
-				default:
-					logEntry.Debug("IGNORE")
-					continue L
-				}
-
-				if e := ns.Respond(sbuf, hi); e != nil {
-					logEntry.Warn("RESPOND error", zap.Error(e))
-					continue L
-				}
-				logEntry.Info("RESPOND")
-				h.WritePacketData(sbuf.Bytes())
-
-			case ip := <-dockerNewIP:
-				logEntry := logger.With(zap.Stringer("ip", ip))
-				if e := Gratuitous(sbuf, hi, ip); e != nil {
-					logEntry.Warn("GRATUITOUS error", zap.Error(e))
-					continue L
-				}
-				logEntry.Info("GRATUITOUS")
-				h.WritePacketData(sbuf.Bytes())
-
-				if !hi.GatewayIP.IsValid() {
-					break
-				}
-				if e := Solicit(sbuf, hi, ip); e != nil {
-					logEntry.Warn("SOLICIT error", zap.Error(e))
-					continue L
-				}
-				logEntry.Info("SOLICIT")
-				h.WritePacketData(sbuf.Bytes())
+			ns := <-solicitations
+			logEntry := logger.With(zap.Stringer("ns", ns))
+			if !ns.DestIP.IsMulticast() || !targetSubnets.Contains(ns.TargetIP) {
+				logEntry.Debug("IGNORE")
+				continue
 			}
+			logEntry = logEntry.With(zap.String("reason", "static"))
+
+			if e := ns.Respond(sbuf, hi); e != nil {
+				logEntry.Warn("RESPOND error", zap.Error(e))
+				continue
+			}
+			logEntry.Info("RESPOND")
+			h.WritePacketData(sbuf.Bytes())
 		}
-	},
-	After: func(c *cli.Context) error {
-		if handle != nil {
-			handle.Close()
-		}
-		return nil
 	},
 }
 
